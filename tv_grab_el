@@ -1,0 +1,1891 @@
+#!/usr/bin/perl -w
+
+eval 'exec /usr/bin/perl -w -S $0 ${1+"$@"}'
+	if 0; # not running under some shell
+
+=pod
+
+=head1 NAME
+
+tv_grab_el - Grab TV listings for Greece.
+
+=head1 SYNOPSIS
+
+tv_grab_el --help
+
+tv_grab_el --configure [--config-file FILE] [--gui OPTION] [--slow]
+
+tv_grab_el [--config-file FILE] [--output FILE] [--gui OPTION]
+			[--days N] [--offset N] [--slow] [--quiet]
+
+tv_grab_el --list-channels [--output FILE] [--gui OPTION]
+
+=head1 DESCRIPTION
+
+Output TV listings for several channels available in Greece.
+The data comes from tv.pathfinder.gr. The grabber relies on
+parsing HTML so it might stop working at any time.
+
+First run B<tv_grab_el --configure> to choose, which channels you want
+to download. Then running B<tv_grab_el> with no arguments will output
+listings in XML format to standard output.
+
+B<--configure> Prompt for which channels,
+and write the configuration file.
+
+B<--config-file FILE> Set the name of the configuration file, the
+default is B<~/.xmltv/tv_grab_el.conf>. This is the file written by
+B<--configure> and read when grabbing.
+
+B<--gui OPTION> Use this option to enable a graphical interface to be used.
+OPTION may be "Tk", or left blank for the best available choice.
+Additional allowed values of OPTION are "Term" for normal terminal output
+(default) and "TermNoProgressBar" to disable the use of XMLTV::ProgressBar.
+
+B<--output FILE> write to FILE rather than standard output.
+
+B<--days N> grab N days. The default is to grab data for 3 days.
+
+B<--offset N> start N days in the future. The default is to start
+from today.
+
+B<--slow> retrieves extended information on each programme
+(description, duration, credits, etc). 
+This will require one extra download for each programme.
+The default is to grab only title, time, category and rating.
+
+B<--quiet> suppress the progress messages normally written to standard
+error.
+
+B<--comments> writes xml comments in output file. 
+Useful for debugging or parsing.
+
+B<--list-channels> write output giving <channel> elements for every
+channel available (ignoring the config file), but no programmes.
+
+B<--help> print a help message and exit.
+
+=head1 NOTES
+
+The stop time is not available and is taken 
+from the start time of the next programme.
+So, the stop time for the last programme of the day, is missing.
+When the length information exists (in slow mode only),
+it is used to calculate the stop time.
+
+The sub-title field is automatically calulated
+from the fields category, country and date.
+
+=head1 SEE ALSO
+
+L<xmltv(5)>.
+
+=head1 AUTHOR
+
+Panajotis, Panajotis@freemail.gr
+
+Based on tv_grab_be
+Based on tv_grab_el by Tassos Bassoukos, abas@aix.meng.auth.gr.
+Based on tv_grab_fi by Matti Airas.
+
+=head1 BUGS
+
+The data source does not include full channels information and the
+channels are identified by numeric identifiers rather than
+the RFC2838 form recommended by the XMLTV DTD.
+
+=cut
+
+######################################################################
+# initializations
+
+use warnings;
+#use strict;
+#use diagnostics;
+#use Devel::Size qw(size total_size);
+use XMLTV::Version '$Id: tv_grab_el,v 1.1 2005/10/15 10:00:00 epaepa Exp $ ';
+use XMLTV::Capabilities qw/baseline manualconfig cache/;
+use XMLTV::Description 'Greece';
+use Getopt::Long;
+use Date::Manip;
+use HTML::TreeBuilder;
+use HTML::Entities;
+use IO::File;
+
+use XMLTV;
+use XMLTV::Memoize;
+use XMLTV::ProgressBar;
+use XMLTV::Ask;
+use XMLTV::Config_file;
+use XMLTV::DST;
+use XMLTV::Get_nice;
+use XMLTV::Mode;
+use XMLTV::Date;
+
+use XMLTV::Usage <<END
+$0: get Greek television listings in XMLTV format
+To configure: $0 --configure [--config-file FILE] [--gui OPTION] [--slow]
+To grab listings: $0 [--config-file FILE] [--output FILE] [--gui OPTION]
+						[--days N] [--offset N] [--slow] [--quiet]
+To list channels: $0 --list-channels [--output FILE] [--gui OPTION]
+END
+ ;
+
+# Use Log::TraceMessages if installed.
+BEGIN {
+	eval { require Log::TraceMessages };
+	if ($@) {
+		*t = sub {};
+		*d = sub { "" };
+	} else {
+		*t = \&Log::TraceMessages::t;
+		*d = \&Log::TraceMessages::d;
+		Log::TraceMessages::check_argv();
+	}
+}
+
+
+# Functions
+sub grab();
+sub configure();
+sub list_channels();
+
+sub get_writer($);
+sub get_config();
+
+sub get_channels();
+sub write_channels();
+
+sub prepare_listings();
+sub get_listings();
+sub parse_listings();
+sub get_details();
+sub parse_details();
+sub write_listings();
+sub parse_listing($$$);
+sub parse_detail($$);
+
+sub get_url($);
+sub tidy($);
+sub get_content;
+sub get_content_re;
+sub el2en($);
+sub nextday;
+sub _ask_many_boolean( $$@ );
+sub format_time($);
+sub format_size($);
+
+
+# GLOBAL CONSTANTS
+
+# Languages
+my $LANG_EL = "el";
+my $LANG_EN = "en";
+my $LANG = $LANG_EL; # default language
+my %LANGS =  ( $LANG_EL => "greek",
+					$LANG_EN => "english");
+
+# Encodings
+my %ENCODING =  ( $LANG_EL => "iso-8859-7",
+						$LANG_EN => "iso-8859-1");
+
+# Web site
+my $DOMAIN = "nova.gr";
+my $SITE = "http://www.$DOMAIN";
+my %BASE_URL =  ( $LANG_EL => "$SITE/gr/",
+						$LANG_EN => "$SITE/eng/");
+
+# The winter timezone in Greece. Summer time is one hour ahead of this.
+my $TZ="+0200";
+
+# The writer
+my $writer;
+# The listings
+my %listings;
+# The channels
+my %channels;
+# Detail category filter
+my %detail_categories;
+# Detail time filter
+my $detail_starttime;
+my $detail_stoptime;
+
+# Statistics
+my $num_listings=0;
+my $num_listings_gets=0;
+my $num_programmes=0;
+my $num_details=0;
+my $num_details_gets=0;
+my $num_webgets=0;
+my $size_webgets=0;
+my $stat_starttime=time();
+
+# quick greek to latin transcoding map
+my %EL2EN = (
+	"\x{00b4}"=>"",  # u+0384	greek tonos
+	"\x{00b5}"=>"",  # u+0385	greek dialytika tonos
+	"\x{00b6}"=>"A", # u+0386	greek capital letter alpha with tonos
+	"\x{00b7}"=>";", # u+00b7	middle dot
+	"\x{00b8}"=>"E", # u+0388	greek capital letter epsilon with tonos
+	"\x{00b9}"=>"I", # u+0389	greek capital letter eta with tonos
+	"\x{00ba}"=>"I", # u+038a	greek capital letter iota with tonos
+	"\x{00bb}"=>'"', # u+00bb	right-pointing double angle quotation mark
+	"\x{00bc}"=>"O", # u+038c	greek capital letter omicron with tonos
+	"\x{00be}"=>"Y", # u+038e	greek capital letter upsilon with tonos
+	"\x{00bf}"=>"O", # u+038f	greek capital letter omega with tonos
+	"\x{00c0}"=>"I", # u+0390	greek small letter iota with dialytika and tonos
+	"\x{00c1}"=>"A", # u+0391	greek capital letter alpha
+	"\x{00c2}"=>"B", # u+0392	greek capital letter beta
+	"\x{00c3}"=>"G", # u+0393	greek capital letter gamma
+	"\x{00c4}"=>"D", # u+0394	greek capital letter delta
+	"\x{00c5}"=>"E", # u+0395	greek capital letter epsilon
+	"\x{00c6}"=>"Z", # u+0396	greek capital letter zeta
+	"\x{00c7}"=>"I", # u+0397	greek capital letter eta
+	"\x{00c8}"=>"TH",# u+0398	greek capital letter theta
+	"\x{00c9}"=>"I", # u+0399	greek capital letter iota
+	"\x{00ca}"=>"K", # u+039a	greek capital letter kappa
+	"\x{00cb}"=>"L", # u+039b	greek capital letter lamda
+	"\x{00cc}"=>"M", # u+039c	greek capital letter mu
+	"\x{00cd}"=>"N", # u+039d	greek capital letter nu
+	"\x{00ce}"=>"X", # u+039e	greek capital letter xi
+	"\x{00cf}"=>"O", # u+039f	greek capital letter omicron
+	"\x{00d0}"=>"P", # u+03a0	greek capital letter pi
+	"\x{00d1}"=>"R", # u+03a1	greek capital letter rho
+	"\x{00d3}"=>"S", # u+03a3	greek capital letter sigma
+	"\x{00d4}"=>"T", # u+03a4	greek capital letter tau
+	"\x{00d5}"=>"Y", # u+03a5	greek capital letter upsilon
+	"\x{00d6}"=>"F", # u+03a6	greek capital letter phi
+	"\x{00d7}"=>"H", # u+03a7	greek capital letter chi
+	"\x{00d8}"=>"PS",# u+03a8	greek capital letter psi
+	"\x{00d9}"=>"O", # u+03a9	greek capital letter omega
+	"\x{00da}"=>"I", # u+03aa	greek capital letter iota with dialytika
+	"\x{00db}"=>"Y", # u+03ab	greek capital letter upsilon with dialytika
+	"\x{00dc}"=>"a", # u+03ac	greek small letter alpha with tonos
+	"\x{00dd}"=>"e", # u+03ad	greek small letter epsilon with tonos
+	"\x{00de}"=>"i", # u+03ae	greek small letter eta with tonos
+	"\x{00df}"=>"i", # u+03af	greek small letter iota with tonos
+	"\x{00e0}"=>"y", # u+03b0	greek small letter upsilon with dialytika and tonos
+	"\x{00e1}"=>"a", # u+03b1	greek small letter alpha
+	"\x{00e2}"=>"b", # u+03b2	greek small letter beta
+	"\x{00e3}"=>"g", # u+03b3	greek small letter gamma
+	"\x{00e4}"=>"d", # u+03b4	greek small letter delta
+	"\x{00e5}"=>"e", # u+03b5	greek small letter epsilon
+	"\x{00e6}"=>"z", # u+03b6	greek small letter zeta
+	"\x{00e7}"=>"i", # u+03b7	greek small letter eta
+	"\x{00e8}"=>"th",# u+03b8	greek small letter theta
+	"\x{00e9}"=>"i", # u+03b9	greek small letter iota
+	"\x{00ea}"=>"k", # u+03ba	greek small letter kappa
+	"\x{00eb}"=>"l", # u+03bb	greek small letter lamda
+	"\x{00ec}"=>"m", # u+03bc	greek small letter mu
+	"\x{00ed}"=>"n", # u+03bd	greek small letter nu
+	"\x{00ee}"=>"x", # u+03be	greek small letter xi
+	"\x{00ef}"=>"o", # u+03bf	greek small letter omicron
+	"\x{00f0}"=>"p", # u+03c0	greek small letter pi
+	"\x{00f1}"=>"r", # u+03c1	greek small letter rho
+	"\x{00f2}"=>"s", # u+03c2	greek small letter final sigma
+	"\x{00f3}"=>"s", # u+03c3	greek small letter sigma
+	"\x{00f4}"=>"t", # u+03c4	greek small letter tau
+	"\x{00f5}"=>"y", # u+03c5	greek small letter upsilon
+	"\x{00f6}"=>"f", # u+03c6	greek small letter phi
+	"\x{00f7}"=>"h", # u+03c7	greek small letter chi
+	"\x{00f8}"=>"ps",# u+03c8	greek small letter psi
+	"\x{00f9}"=>"o", # u+03c9	greek small letter omega
+	"\x{00fa}"=>"i", # u+03ca	greek small letter iota with dialytika
+	"\x{00fb}"=>"y", # u+03cb	greek small letter upsilon with dialytika
+	"\x{00fc}"=>"o", # u+03cc	greek small letter omicron with tonos
+	"\x{00fd}"=>"y", # u+03cd	greek small letter upsilon with tonos
+	"\x{00fe}"=>"o", # u+03ce	greek small letter omega with tonos
+);
+
+# The types of credits that we will search for in the received HTML
+my %credits_search = (
+	$LANG_EN=> { "director"=>"Director", 
+					 "actor"=>"Actor" },
+	$LANG_EL=> { "director"=>"\x{00d3}\x{00ea}\x{00e7}\x{00ed}\x{00ef}".
+									 "\x{00e8}\x{00dd}\x{00f4}\x{00e7}\x{00f2}", 
+					 "actor"=>"\x{00c7}\x{00e8}\x{00ef}\x{00f0}".
+					 			 "\x{00ef}\x{00e9}\x{00ef}\x{00df}" },
+);
+
+######################################################################
+# get options
+
+# Get options, including undocumented --cache option.
+XMLTV::Memoize::check_argv("XMLTV::Get_nice::get_nice_aux");
+XMLTV::Memoize::check_argv("get_url");
+
+my ($opt_days, $opt_offset, $opt_help, $opt_output,
+	$opt_configure, $opt_config_file, $opt_gui,
+	$opt_quiet, $opt_list_channels, $opt_slow, $opt_comments);
+$opt_days	= 3; # default
+$opt_offset	= 0; # default
+$opt_quiet	= 0; # default
+$opt_slow	= 1; # default
+$opt_comments=0; # default
+GetOptions( "days=i"		=> \$opt_days,
+			"offset=i"		=> \$opt_offset,
+			"help"			=> \$opt_help,
+			"configure"		=> \$opt_configure,
+			"config-file=s"=> \$opt_config_file,
+			"gui:s"			=> \$opt_gui,
+			"output=s"		=> \$opt_output,
+			"quiet"			=> \$opt_quiet,
+			"list-channels"=> \$opt_list_channels,
+			"slow"			=> \$opt_slow,
+	)
+ or usage(0);
+
+die "number of days must not be negative"
+	if (defined $opt_days && $opt_days < 0);
+
+usage(1) if $opt_help;
+
+XMLTV::Ask::init($opt_gui);
+
+# Set delay in secs between url fetching
+$XMLTV::Get_nice::Delay=1;
+
+# Get mode
+my $mode = XMLTV::Mode::mode("grab", # default
+				$opt_configure => "configure",
+				$opt_list_channels => "list-channels");
+
+# Check operation
+if ($mode eq "configure") {
+	configure();
+
+} elsif ($mode eq "list-channels") {
+	list_channels();
+
+} elsif ($mode eq "grab") {
+	grab();
+}
+
+printf STDERR "Accessed %d web pages, downloaded %s, duration %s\n",
+		$num_webgets, format_size($size_webgets), 
+		format_time(time()-$stat_starttime)
+	unless $opt_quiet;
+
+exit();
+
+######################################################################
+# Main subroutine definitions
+
+# Get the XMLTV::Writer
+sub get_writer($) {
+	# Do we use different languages?
+	my $multilang=shift;
+	# Options to be used for XMLTV::Writer.
+	my %w_args;
+	if (defined $opt_output) {
+		my $fh = new IO::File(">$opt_output");
+		die "cannot write to $opt_output: $!" if not defined $fh;
+		$w_args{"OUTPUT"} = $fh;
+	}
+	$w_args{"encoding"} = $multilang ? $ENCODING{$LANG_EL} : $ENCODING{$LANG};
+	# New Writer
+	$writer = new XMLTV::Writer(%w_args);
+	$writer->start({
+		"source-info-url"		=> "$SITE",
+		"source-info-name"	=> "NOVA Greece",
+		"source-data-url"		=> "$BASE_URL{$LANG}tvguide.asp",
+		"generator-info-name"=> "XMLTV",
+		"generator-info-url" => "http://membled.com/work/apps/xmltv/"
+	});
+}
+
+# Get the list of channels
+sub get_channels() {
+	# Set progress bar
+	my $bar = new XMLTV::ProgressBar("getting channels", 2)
+		if not $opt_quiet;
+
+	# Fetch data
+	my $url=$BASE_URL{$LANG};
+	print STDERR "\nFetching $url\n" if not $opt_quiet;
+	my $data = get_url($url);
+	die "could not get channel listing from $url\n aborting\n"
+		if not defined $data;
+
+	# Update progress bar
+	$bar->update() if not $opt_quiet;
+
+	# Parse data
+	my $tree = HTML::TreeBuilder->new();
+	$tree->parse($data);
+
+	# Get all links that use channel
+	my @channel_elems = $tree->look_down("_tag"=>"a",
+		"href"=>qr/channel=\d+$/);
+
+	my $channel_no=1;
+	# Loop elements
+	foreach my $elem (@channel_elems) {
+		# get name
+		my $channel_name=get_content($elem);
+		if (!defined $channel_name) {
+			warn "Illegal channel name";
+			next;
+		}
+		$channel_name=el2en($channel_name) if($LANG eq $LANG_EN);
+
+		# get id
+		$elem->attr("href")=~/channel=(\d+)/;
+		my $channel_id = "${1}";
+
+		# get key
+		my $channel_key=$channel_no;
+		$channel_key="0".$channel_key if $channel_no<10;
+		$channel_no++;
+
+		# add to channels
+		$channels{$channel_key} = {
+			"id" => $channel_id, 
+			"display-name" => $channel_name,
+			"name" => el2en($channel_name)
+		};
+		t "added to channels ($channel_key):($channel_id $channel_name)";
+	}
+
+	# Get programme categories
+	# Category elements are <option> tags in <select> tag "egenre"
+	my @category_sel_elems = $tree->look_down("_tag" => "select", 
+															"name" => "egenre");
+	my @category_elems = map { $_->look_down("_tag" => "option") } 
+									@category_sel_elems;
+
+	my $category_no=1;
+	# Loop elements
+	foreach my $elem (@category_elems) {
+		# get id
+		my $category_id=$elem->attr("value");
+		if ($category_id eq "0") { # skip id zero
+			next;
+		}
+
+		# get name
+		my $category_name=get_content($elem);
+		if (!defined $category_name) {
+			warn "Illegal category name";
+			next;
+		}
+
+		# get key
+		my $category_key=$category_no;
+		$category_key="0".$category_key if $category_no<10;
+		$category_no++;
+
+		# add to categories
+		$detail_categories{$category_key} = {
+			"id" => $category_id, 
+			"name" => el2en($category_name)
+		};
+		t "added to categories ($category_key):($category_id $category_name)";
+	}
+
+	# Update progress bar
+	$bar->update() if not $opt_quiet;
+
+	# Done
+	$bar->finish() if not $opt_quiet;
+
+	#
+	$tree->delete();
+
+	# Check channels
+	die "no channels could be found" if not keys %channels;
+}
+
+# Write the list of channels
+sub write_channels() {
+
+	# Header comment
+	$writer->comment("\n\t\t\t\tC H A N N E L S\n")
+		if $opt_comments;
+
+	# Write channels
+	foreach (sort keys %channels) {
+		my %channel=(
+			"id" => $channels{$_}{"id"}.".".$DOMAIN, 
+			"display-name" => [ [ $channels{$_}{"display-name"}, $LANG ] ], 
+			"url" => [ $BASE_URL{$LANG}."tvguide.asp?action=search&channel=".
+						$channels{$_}{"id"} ],
+		);
+		if($opt_comments) {
+			# Lang comment
+			$channel{"debug_Language"}=$channels{$_}{"lang"}
+				if defined $channels{$_}{"lang"};
+			# Details comment
+			$channel{"debug_Details"}=$channels{$_}{"details"} ? "true" : "false"
+				if $opt_slow and defined $channels{$_}{"details"};
+		}
+		# Write channel
+		$writer->write_channel(\%channel);
+	}
+}
+
+# Output the list of channels
+sub list_channels() {
+	# Ask about language
+	my $l;
+	$l = ask_choice("\nWhich language would you like to use? ",
+					$LANGS{$LANG}, $LANGS{$LANG_EL}, $LANGS{$LANG_EN});
+	if(defined $l) {
+		foreach(keys %LANGS) {
+			$LANG=$_ if $l eq $LANGS{$_};
+		}
+	}
+	# Get writer
+	get_writer(0);
+	# Get channels
+	get_channels();
+	# Write channels
+	write_channels();
+	# Done
+	$writer->end();
+}
+
+# Configure
+sub configure() {
+
+	# Config file
+	my $config_file = XMLTV::Config_file::filename($opt_config_file, 
+																  "tv_grab_el", $opt_quiet);
+
+	# Check overwrite
+	XMLTV::Config_file::check_no_overwrite($config_file);
+
+	# Open config file
+	open(CONF, ">$config_file") or die "cannot write to $config_file: $!";
+
+	# Get language
+	my $l;
+	$l = ask_choice("\nWhich language would you like to use as default? ",
+					$LANGS{$LANG}, $LANGS{$LANG_EL}, $LANGS{$LANG_EN});
+	if(defined $l) {
+		foreach(keys %LANGS) {
+			$LANG=$_ if $l eq $LANGS{$_};
+		}
+	}
+
+	# Get channels
+	get_channels();
+
+	# Set category defaults
+	my @category_keys;
+	my $category_filtering=0;
+	if(keys %detail_categories) {
+		@category_keys = sort keys %detail_categories;
+		foreach (@category_keys) {
+			$detail_categories{$_}{"details"}=1;
+		}
+	}
+
+	# Set channel defaults
+	my @channel_keys = sort keys %channels;
+	foreach (@channel_keys) {
+		$channels{$_}{"grab"}=0;
+		$channels{$_}{"lang"}=$LANG;
+		$channels{$_}{"details"}=1;
+	}
+
+	# Ask to grab each channel
+	my @channel_names = map { $channels{$_}{"name"} } @channel_keys;
+	my @qs = map { "grab listings for channel $_?" } @channel_names;
+	my @want = _ask_many_boolean("\nSelect channels for grabbing listings\n", 
+											1, @qs);
+	foreach (@channel_keys) {
+		my $w = shift @want;
+		warn("cannot read input, stopping questions"), last
+			if not defined $w;
+
+		$channels{$_}{"grab"}=$w;
+	}
+
+	# set collections to channels we grab 
+	@channel_keys = grep { $channels{$_}{"grab"} } @channel_keys;
+	@channel_names = map { $channels{$_}{"name"} } @channel_keys;
+
+	my $bl = ask_boolean("\nWould you like to use different language ".
+								"for some channels? ",0);
+	if(defined $bl && $bl){
+		# Ask language to use for each channel
+		my $OTHER_LANG=($LANG eq $LANG_EL ? $LANG_EN : $LANG_EL);
+		@qs = map { "use $LANGS{$LANG} for channel $_?" } @channel_names;
+		@want = _ask_many_boolean("\nSelect language for each channel".
+			"\nAnswering 'no' results in using $LANGS{$OTHER_LANG}\n", 1, @qs);
+		foreach (@channel_keys) {
+			my $w = shift @want;
+			warn("cannot read input, stopping questions"), last
+				if not defined $w;
+
+			$channels{$_}{"lang"}= $w ? $LANG : $OTHER_LANG;
+		}
+	}
+
+	# Configure for slow mode
+	if(not $opt_slow){
+		my $bd = ask_boolean("\nWould you like to configure ".
+									"detailed information grabbing? ",1);
+		$opt_slow=(defined $bd && $bd);
+	}
+
+	if($opt_slow){
+		say(<<END
+Configuring with --slow:
+
+Detailed information grabbing will require 1 web page get for 
+every program. This is slow, hard work on the web-server
+and may upset the listings provider...
+
+To limit this, there are three selection critera:
+Time range (ie. only programs between 19:00 and 00:00)
+Category (ie. only Movie, Series)
+Channel (ie. only get detailed info for Filmnet, Star)
+
+If all defined citeria match, then program detail will be obtained.
+
+Note: for time range, the early hours of the morning
+are assumed to be in the same "day" as the late ours
+of the night, so 17:00-02:00 is a valid range.
+END
+		);
+
+		my $bt = ask_boolean("\nWould you like to filter detail grabbing ".
+									"by time?".
+									"\nAnswering 'no' results in grabbing ".
+									"details for whole day.",1);
+		if(defined $bt && $bt) {
+
+			# Time range loop:
+			TIME_RANGE_LOOP: 
+			for (;;) { 
+
+				# Get start time
+				START_LOOP: for (;;) {
+					$detail_starttime = ask("Enter a starting time for grabbing ".
+													"details (24h format: [17:00]) ");
+					die "could not read answer\n" if not defined $detail_starttime;
+					if($detail_starttime eq "") {
+						$detail_starttime="17:00";
+						last START_LOOP;
+					} else {
+						$detail_starttime =~ s/^\s+//; $detail_starttime =~ s/\s+$//;
+						if ( $detail_starttime =~ /^([0-9]{2}):([0-9]{2})$/ 
+							&& $1 ge 0 && $1 lt 24 
+							&& $2 ge 0 && $2 lt 60 ) {
+							last START_LOOP;
+						}
+						say ( "Invalid time format: $detail_starttime");
+					}
+				}
+
+				# Get stop time
+				STOP_LOOP:
+				for (;;) {
+					$detail_stoptime = ask("Enter an ending time for grabbing ".
+													"details (24h format: [02:00]) ");
+					die "could not read answer\n" if not defined $detail_stoptime;
+					if($detail_stoptime eq "") {
+						$detail_stoptime="02:00";
+						last STOP_LOOP;
+					} else {
+						$detail_stoptime =~ s/^\s+//; $detail_stoptime =~ s/\s+$//;
+						if ( $detail_stoptime =~ /^([0-9]{2}):([0-9]{2})$/ 
+							&& $1 ge 0 && $1 lt 24 
+							&& $2 ge 0 && $2 lt 60 ) {
+							last STOP_LOOP;
+						}
+						say ( "Invalid time format: $detail_stoptime");
+					}
+				}
+
+				# Done
+				last TIME_RANGE_LOOP;
+			}
+		}
+
+		if(keys %detail_categories) {
+			my $bc = ask_boolean("\nWould you like to filter detail grabbing ".
+										"by programme category?".
+										"\nAnswering 'no' results in grabbing details ".
+										"for all categories.",1);
+			if(defined $bc && $bc) {
+				$category_filtering=1;
+				# Ask to grab details for each category
+				my @category_names = map { $detail_categories{$_}{"name"} } 
+													@category_keys;
+				@qs = map { "grab details for programme of category $_?" } 
+								@category_names;
+				@want = _ask_many_boolean("\nSelect categories for detail ".
+													"grabbing of programmes\n", 0, @qs);
+				foreach (@category_keys) {
+					my $w = shift @want;
+					warn("cannot read input, stopping questions"), last
+						if not defined $w;
+
+					$detail_categories{$_}{"details"}=$w;
+				}
+			}
+		}
+
+		my $bcc = ask_boolean("\nWould you like to filter detail grabbing ".
+										"by channel?".
+									 "\nAnswering 'no' results in grabbing details ".
+									 "for all channels.",1);
+		if(defined $bcc && $bcc) {
+			# Ask to grab details for each channel
+			@qs = map { "grab details for channel $_?" } @channel_names;
+			@want = _ask_many_boolean("\nSelect channels for detail grabbing ".
+												"of programmes\n", 0, @qs);
+			foreach (@channel_keys) {
+				my $w = shift @want;
+				warn("cannot read input, stopping questions"), last
+					if not defined $w;
+
+				$channels{$_}{"details"}=$w;
+			}
+		}
+
+	}
+
+	# Write header
+	print CONF <<END
+\#
+\# tv_grab_el config file.
+\#
+\# Format is:
+\# language <$LANG_EL|$LANG_EN>
+\# detail-starttime <24hr clock time>
+\# detail-stoptime <24hr clock time>
+\# detail-category <category_id>	\#- may be repeated mutiple times
+\# channel <channel_id> [<$LANG_EL|$LANG_EN>] [dodetail] \#- may be repeated mutiple times
+\# 
+END
+	;
+
+	# Write language
+	print CONF <<END
+
+\#
+\# definition of default language
+\#
+\# supported languages are $LANG_EL (greek) or $LANG_EN (english)
+\#
+END
+	;
+	print CONF "language $LANG\n";
+
+	# Write time filter
+	print CONF <<END
+
+\#
+\# definition of start and stop times for filtering of
+\# grabbing detailed information for programmes. 
+\#
+\# Times must be in 24 hour clock
+\# and may overlap a day boundary (eg 17:00 - 02:00)
+\#
+\# Setting of any of the two values will enable the filtering,
+\# otherwise programmes of any time-range are grabbed.
+\#
+END
+	;
+	if(defined $detail_starttime) {
+		print CONF " detail-starttime $detail_starttime\n";
+	} else {
+		print CONF "#detail-starttime\n";
+	}
+	if(defined $detail_stoptime) {
+		print CONF " detail-stoptime $detail_stoptime\n";
+	} else {
+		print CONF "#detail-stoptime\n";
+	}
+
+	# Write channels
+	print CONF <<END
+
+\# 
+\# definition of categories for filtering of
+\# grabbing detailed information for programmes.
+\# 
+\# multiple category lines can be defined as:
+\# detail-category category_id
+\#
+\# The category ids are provider specific.
+\# Setting of even one category will enable the filtering,
+\# otherwise programmes of any category are grabbed.
+\#
+END
+	;
+	if(keys %detail_categories) {
+		foreach (sort keys %detail_categories) {
+			print CONF ($detail_categories{$_}{"details"} && 
+							$category_filtering) ? " " :"#";
+			print CONF "detail-category ";
+			print CONF $detail_categories{$_}{"id"}."\t";
+			print CONF "\t# ".$detail_categories{$_}{"name"}."\n";
+		}
+	}
+
+	# Write channels
+	print CONF <<END
+
+\# 
+\# definition of channels for grabbing listings
+\# 
+\# multiple channel lines can be defined as:
+\# channel channel_id [<$LANG_EL|$LANG_EN>] [dodetail]
+\#
+\# The channel ids are provider specific.
+\#
+\# specify language to grab info for the channel in that language
+\# (overrides default language)
+\#
+\# specify dodetail to grab detailed information 
+\# for programmes of the channel (in slow mode)
+\#
+END
+	;
+	foreach (sort keys %channels) {
+		print CONF $channels{$_}{"grab"} ? " " :"#";
+		print CONF "channel ";
+		print CONF " " if length($channels{$_}{"id"})<3;
+		print CONF $channels{$_}{"id"};
+		if($channels{$_}{"grab"}) {
+			print CONF "\t".$channels{$_}{"lang"} 
+							if not $channels{$_}{"lang"} eq $LANG;
+			print CONF "\tdodetail" if $channels{$_}{"details"};
+		}
+		print CONF "\t# ".$channels{$_}{"name"}."\n";
+	}
+
+	# Done
+	close CONF or warn "cannot close $config_file: $!";
+	say("\nFinished configuration.");	
+}
+
+# Read configuration
+sub get_config() {
+
+	# Config file
+	my $config_file = XMLTV::Config_file::filename($opt_config_file, 
+																  "tv_grab_el", $opt_quiet);
+
+	my %config;
+
+	# Read file
+	my @config_lines = XMLTV::Config_file::read_lines($config_file);
+	my $line_num = 1;
+	foreach (@config_lines) {
+		++ $line_num;
+		next if not defined;
+
+		# language definition
+		if (/^language:?\s+(\S+)/){
+			# set language
+			if(defined ${1}) {
+				foreach (keys %LANGS) {
+					if(${1} =~ /$_/) {
+						$config{"lang"} = $_;
+						last;
+					}
+				}
+			}
+
+		# detail starttime definition
+		} elsif (/^detail-starttime:?\s+(\d{2}:\d{2})/) {
+			$config{"detail-starttime"}= "${1}";
+
+		# detail stoptime definition
+		} elsif (/^detail-stoptime:?\s+(\d{2}:\d{2})/) {
+			$config{"detail-stoptime"}= "${1}";
+
+		# category definition
+		} elsif (/^detail-category:?\s+(\d+)/) {
+			$config{"detail-categories"}{"${1}"}="${1}";
+
+		# channel definition
+		} elsif (/^channel:?\s+(\d+)(.+)?/) {
+			# get id
+			my $channel_id = "${1}";
+			$config{"channels"}{$channel_id}= { "id"=> $channel_id };
+
+			if(defined ${2}) {
+
+				# set language
+				foreach (keys %LANGS) {
+					if(${2} =~ /\s+$_/) {
+						$config{"channels"}{$channel_id}{"lang"} = $_;
+						last;
+					}
+				}
+
+				# set detail
+				if (${2} =~ /\s+dodetail/) {
+					$config{"channels"}{$channel_id}{"details"} = 1;
+				}
+			}
+
+		} else {
+			warn "$config_file:$line_num: bad line\n";
+		}
+	}
+	
+	return %config;
+}
+
+# Grab listings
+sub grab() {
+
+	# Read configuration
+	my %config=get_config();
+	if(defined $config{"lang"}) {
+		# Set language
+		$LANG=$config{"lang"};
+	}
+
+	# Do we use different languages?
+	my $multilang=0;
+	
+	# Check channels
+	die "no channels specified" 
+		if(not defined $config{"channels"} or not keys %{$config{"channels"}});
+
+	# Get channels
+	get_channels();
+
+	# Check channels
+	foreach (sort keys %channels) {
+		my $channel_id=$channels{$_}{"id"};
+		if(not defined $config{"channels"}{$channel_id}) {
+			# delete channels we don"t grab
+			delete $channels{$_};
+		} else {
+			$config{"channels"}{$channel_id}{"found"}=1;
+			# check lang
+			$channels{$_}{"lang"}=$LANG;
+			if(defined $config{"channels"}{$channel_id}{"lang"}) {
+				$channels{$_}{"lang"}=$config{"channels"}{$channel_id}{"lang"};
+				# Do we use different language?
+				$multilang=1 if($channels{$_}{"lang"} ne $LANG);
+			}
+			# check details
+			$channels{$_}{"details"}=0;
+			if(defined $config{"channels"}{$channel_id}{"details"}) {
+				$channels{$_}{"details"}=$config{"channels"}{$channel_id}{"details"};
+			}
+		}
+	}
+
+	# Check remaining channels
+	die "no channels are set to grab" if not keys %channels;
+
+	# Check that config channels exist
+	foreach (sort keys %{$config{"channels"}}) {
+		if(not defined $config{"channels"}{$_}{"found"}) {
+			warn "channel with id '$_' could not be not found in provider's site!".
+				  "\nRun me with --configure";
+		}
+	}
+
+	if($opt_slow) {
+		# Check detail filter : categories
+		foreach (sort keys %detail_categories) {
+			my $category_id=$detail_categories{$_}{"id"};
+			if(not defined $config{"detail-categories"}{$category_id}) {
+				# delete categories we don"t grab
+				delete $detail_categories{$_};
+			}
+		}
+		
+		# Check detail filter : time
+		if(defined $config{"detail-starttime"}) {
+			$detail_starttime=$config{"detail-starttime"};
+		}
+		if(defined $config{"detail-stoptime"}) {
+			$detail_stoptime=$config{"detail-stoptime"};
+		}
+	}
+
+	# Get writer
+	get_writer($multilang);
+
+	# Prepare listings
+	prepare_listings();
+
+	#printf STDERR "Prepare: Listings: ".get_size(\%listings)."\n"
+	#	unless $opt_quiet;
+
+	# Write info
+	write_info()
+		if $opt_comments;
+
+	# Write channels
+	write_channels();
+
+	# Get listings
+	get_listings();
+
+	# Check if we got all of them
+	if($num_listings_gets!=$num_listings) {
+		my $dt = ask_boolean("\nSome listings (".
+									($num_listings-$num_listings_gets).
+									") could be retrieved from the server.".
+									"\nWould you like to retry downloading?", 1);
+		if(defined $dt && $dt) {
+			$num_listings-=$num_listings_gets;
+			
+			# Get listings
+			get_listings();
+		}
+	}
+	
+	#printf STDERR "Get: Listings: ".get_size(\%listings)."\n" 
+	#	unless $opt_quiet;
+
+	# Parse listings
+	parse_listings();
+
+	#printf STDERR "Parse: Listings: ".get_size(\%listings)."\n"
+	#	unless $opt_quiet;
+	
+	if($opt_slow) {
+	
+		# Get details
+		get_details();
+
+		# Check if we got all of them
+		if($num_details_gets!=$num_details) {
+			my $dt = ask_boolean("\nSome details (".
+										($num_details-$num_details_gets).
+										") could be retrieved from the server.".
+										"\nWould you like to retry downloading?", 1);
+			if(defined $dt && $dt) {
+				$num_details-=$num_details_gets;
+				
+				# Get details
+				get_details();
+			}
+		}
+		
+		#printf STDERR "Get: Listings: ".get_size(\%listings)."\n"
+		#	unless $opt_quiet;
+	
+		# Parse details
+		parse_details();
+		
+		#printf STDERR "Parse: Listings: ".get_size(\%listings)."\n"
+		#	unless $opt_quiet;
+	}
+
+	# Write listings
+	write_listings();
+
+	# Done
+	$writer->end();
+}
+
+
+# Prepares the list of listings to grab
+sub prepare_listings() {
+
+	# Set progress bar
+	my $bar = new XMLTV::ProgressBar("preparing listings", 
+												$opt_days * scalar(keys %channels))
+		if not $opt_quiet;
+
+	# Set start day
+	my $now = DateCalc(parse_date("now"), "$opt_offset days");
+	my $day = UnixDate($now,"%Q");
+	
+	# For each day
+	for (my $i=0;$i<$opt_days;$i++) {
+		
+		# For each channel
+		foreach my $channel_key (sort keys %channels) {
+			my $uday = UnixDate($day, "%d/%m/%Y");
+			my $url = $BASE_URL{$channels{$channel_key}{"lang"}}."tvguide.asp".
+				"?action=search".
+				"&channel=".$channels{$channel_key}{"id"}.
+				"&weekday=".$uday;
+
+			$listings{$day}{$channel_key}{"listing-url"}=$url;
+			$listings{$day}{$channel_key}{"programmes"}=();
+			
+			# Update progress bar
+			update $bar if not $opt_quiet;
+
+			# Update statistics
+			$num_listings++;
+		}
+
+		#for each day
+		$day=nextday($day);
+		die if not defined $day;
+	}
+
+	# Done
+	$bar->finish() if not $opt_quiet;
+}
+
+# Gets listings
+sub get_listings() {
+
+	# Set progress bar
+	my $bar = new XMLTV::ProgressBar("getting listings", $num_listings)
+		if not $opt_quiet;
+
+	# For each day
+	foreach my $day (sort keys %listings) {
+	
+		# For each channel
+		foreach my $channel_key (sort keys %{$listings{$day}}) {
+		
+			if(!defined $listings{$day}{$channel_key}{"listing-html"}) {
+				my $url = $listings{$day}{$channel_key}{"listing-url"};
+				t "fetching listing: $url";
+				my $listing_data=get_url($url);
+				if(not defined $listing_data) {
+					warn "Could not get listing data from $url\n";
+				} else {
+					# store listing-html
+					$listings{$day}{$channel_key}{"listing-html"}=
+						get_real_data($listing_data);
+					# Update statistics
+					$num_listings_gets++;
+				}
+
+				# Update progress bar
+				update $bar if not $opt_quiet;
+			}
+		}
+	}
+	
+	# Done
+	$bar->finish() if not $opt_quiet;
+}
+
+# Parses listings
+sub parse_listings() {
+
+	# Set progress bar
+	my $bar = new XMLTV::ProgressBar("parsing listings", $num_listings_gets)
+		if not $opt_quiet;
+
+	# Store detail filter times
+	my $ldetail_starttime=$detail_starttime;
+	my $ldetail_stoptime=$detail_stoptime;
+	$ldetail_stoptime =~ s/^24/00/s	if(defined $ldetail_stoptime);
+
+	# For each day
+	foreach my $day (sort keys %listings) {
+	
+		if($opt_slow) {
+			# Set detail filter dates
+			if(defined $ldetail_starttime) {
+				my $start=parse_local_date("$day $ldetail_starttime", $TZ);
+				my ($start_base, $start_tz) = @{date_to_local($start, $TZ)};
+				$detail_starttime=UnixDate($start_base, "%q")." ".$start_tz;
+			}
+			if(defined $ldetail_stoptime) {
+				my $stop;
+				# Check if stoptime is after midnight
+				if(Date_Cmp(UnixDate($ldetail_starttime,"%H:%M"), 
+											UnixDate($ldetail_stoptime,"%H:%M"))>0) {
+					$stop=parse_local_date(nextday($day)." $ldetail_stoptime", $TZ);
+				} else {
+					$stop=parse_local_date("$day $ldetail_stoptime", $TZ);
+				}
+				my ($stop_base, $stop_tz) = @{date_to_local($stop, $TZ)};
+				$detail_stoptime=UnixDate($stop_base, "%q")." ".$stop_tz;
+			}
+		}
+
+		# For each channel
+		foreach my $channel_key (sort keys %{$listings{$day}}) {
+		
+			# Get stored html
+			my $listing_data= delete $listings{$day}{$channel_key}{"listing-html"};
+			if(defined $listing_data) {
+			
+				# Parse detail
+				parse_listing($channel_key, $day, $listing_data);
+				
+				# Update progress bar
+				update $bar if not $opt_quiet;
+			}		
+		}
+	}
+	
+	# Done
+	$bar->finish() if not $opt_quiet;
+}
+
+# Gets details
+sub get_details() {
+	# Set progress bar
+	my $bar = new XMLTV::ProgressBar("getting details", $num_details)
+		if not $opt_quiet;
+
+	# For each day
+	foreach my $day (sort keys %listings) {
+	
+		# For each channel
+		foreach my $channel_key (sort keys %{$listings{$day}}) {
+
+			# For each programme
+			foreach my $programme(@{$listings{$day}{$channel_key}{"programmes"}}) {
+
+				my $url = $programme->{"detail-url"};
+				if(defined $url && !defined $programme->{"detail-html"}) {
+					t "fetching detail: $url";
+					my $programme_data=get_url($url);
+					if(not defined $programme_data) {
+						warn "Could not get detailed programme data from $url\n";
+					} else {
+						# store detail-html
+						$programme->{"detail-html"}=get_real_data($programme_data);
+						# delete detail-url
+						delete $programme->{"detail-url"};
+						# Update statistics
+						$num_details_gets++;
+					}
+
+					# Update progress bar
+					update $bar if not $opt_quiet;
+				}
+			}
+		}
+	}
+	
+	# Done
+	$bar->finish() if not $opt_quiet;
+}
+
+# Parses programme details
+sub parse_details() {
+	# Set progress bar
+	my $bar = new XMLTV::ProgressBar("parsing details", $num_details_gets)
+		if not $opt_quiet;
+
+	# For each day
+	foreach my $day (sort keys %listings) {
+	
+		# For each channel
+		foreach my $channel_key (sort keys %{$listings{$day}}) {
+
+			# For each programme
+			foreach my $programme(@{$listings{$day}{$channel_key}{"programmes"}}) {
+
+				# Get stored html
+				if(defined $programme->{"detail-html"}) {
+				
+					# Parse detail
+					parse_detail($channel_key, $programme);
+					
+					# Update progress bar
+					update $bar if not $opt_quiet;
+				}
+			}
+		}
+	}
+	
+	# Done
+	$bar->finish() if not $opt_quiet;
+}
+
+# Writes listings
+sub write_listings() {
+	
+	# Set progress bar
+	my $bar = new XMLTV::ProgressBar("writing listings", $num_programmes)
+		if not $opt_quiet;
+
+	# Header comment
+	$writer->comment("\n\t\t\t\tL I S T I N G S\n")
+		if $opt_comments;
+
+	# For each day
+	foreach my $day (sort keys %listings) {
+	
+		# For each channel
+		foreach my $channel_key (sort keys %{$listings{$day}}) {
+	
+			# Channel comment
+			$writer->comment("==================================================".
+								  "\n ".
+								  "Date: ".$day.
+								  "\tChannel: ".$channels{$channel_key}{"name"}.
+								  "\n ".
+								  "URL: ".$listings{$day}{$channel_key}{"listing-url"}.
+								  "\n ".
+								  "==================================================")
+			   if $opt_comments;
+
+			# For each programme
+			foreach my $programme(@{$listings{$day}{$channel_key}{"programmes"}}) {
+
+				# delete temporary fields
+				delete $programme->{"time"};
+				delete $programme->{"timezone"};
+				delete $programme->{"detail-url"};
+				delete $programme->{"detail-html"};
+
+				# Write programme
+				$writer->write_programme($programme);
+
+				# Update progress bar
+				update $bar if not $opt_quiet;
+			}
+		}
+	}
+
+	# Done
+	$bar->finish() if not $opt_quiet;
+}
+
+# Writes info about current run
+sub write_info() {
+	
+	# Header comment
+	$writer->comment("\n\t\t\t\tI N F O\n");
+
+	# Lang comment
+	$writer->comment("Default language: ".$LANG);
+
+	# Date comments
+	foreach my $day (sort keys %listings) {
+		$writer->comment("Date: ".$day);
+	}
+	
+	# Detail comments
+	$writer->comment("Details: ".($opt_slow ? "true" : "false"));
+	if($opt_slow) {
+		$writer->comment("Detail start time: ".
+								(defined $detail_starttime ? $detail_starttime : 
+								"not set"));
+		$writer->comment("Detail stop time: ".
+								(defined $detail_stoptime ? $detail_stoptime : 
+								"not set"));
+		if(not keys %detail_categories) {
+			$writer->comment("Detail category: not set");
+		} else {
+			foreach (sort keys %detail_categories) {
+				$writer->comment("Detail category: ".$detail_categories{$_}{"id"});
+			}
+		}
+	}
+}
+
+# Parses programme listing
+sub parse_listing( $$$ ) {
+	my $channel_key=shift;
+	my $listing_day=shift;
+	my $listing_data=shift;
+	my $channel_id=$channels{$channel_key}{"id"};
+	my $channel_lang=$channels{$channel_key}{"lang"};
+	my $day=$listing_day;
+	my $bump_start_day=0;
+	my $previous;
+	
+	# Parse data
+	my $tree = HTML::TreeBuilder->new();
+	$tree->parse($listing_data);
+
+	# Find <td>s that contain time info
+	my @time_elems = $tree->look_down("_tag"=>"td", "class"=>"std",
+		sub { defined $_[0]->as_trimmed_text() && 
+				$_[0]->as_trimmed_text()=~/^\d\d:\d\d$/});
+
+	foreach my $time_elem (@time_elems) {
+		my %programme;
+		
+		# Set the date as debug info
+		$programme{"debug_Date"}=$listing_day
+			if $opt_comments;
+		
+		# Set the channel
+		$programme{"channel"}=$channel_id.".$DOMAIN";
+		
+		# Get the time
+		$programme{"time"} = get_content($time_elem);
+		next if not defined $programme{"time"};
+
+		# Change the hour from 24 to 00.
+		$programme{"time"} =~ s/^24/00/s;
+		t "\n time: $programme{'time'}";
+
+		# Check if it's new day
+		if (!$bump_start_day && defined $previous &&
+			Date_Cmp(UnixDate($previous->{"time"},"%H:%M"), 
+						UnixDate($programme{"time"},"%H:%M"))>0) {
+			t "\nnew day";
+			$bump_start_day=1;
+			$day=nextday($day);
+			die if not defined $day;
+		}
+		
+		# Set start time
+		my $start=parse_local_date("$day $programme{'time'}", $TZ);
+		my ($start_base, $start_tz) = @{date_to_local($start, $TZ)};
+		$programme{"start"}=UnixDate($start_base, "%q")." ".$start_tz;
+		t "	$programme{'start'}";
+		$programme{"timezone"}=$start_tz;
+		
+		# Set stop time in previous
+		$previous->{"stop"}=$programme{"start"} if(defined $previous);
+
+		# Get the title element
+		my $title_elem = $time_elem->right();
+		next if not defined $title_elem;
+
+		# First extract the sub-title inside div
+		my @subtitle_elem = $title_elem->look_down("_tag"=>"div", 
+																 "class"=>"std");
+		if(scalar(@subtitle_elem)) {
+			my $pr_subtitle=get_content($subtitle_elem[0]);
+			$programme{"previously-shown"} = {} 
+				if $pr_subtitle =~ s/\s*[(][\x{00c5}ER][)]\s*// ;
+			$pr_subtitle =~ s/(^\s+|\s+$)//;
+			$pr_subtitle = el2en($pr_subtitle) if $channel_lang eq $LANG_EN;
+			$programme{"sub-title"} = [ [$pr_subtitle, $channel_lang] ] 
+				if length($pr_subtitle);
+			t " sub-title: ".el2en($pr_subtitle);
+			#remove from parent
+			foreach(@subtitle_elem) {
+				$_->detach(); 
+			}
+		}
+
+		# Get the rating
+		my @rating_elem = $title_elem->look_down("_tag"=>"img", 
+															  "src"=>qr/age..gif/);
+		if(scalar(@rating_elem)) {
+			my $pr_rating_alt=$rating_elem[0]->attr("alt");
+			$pr_rating_alt =~ m%^\s*(\S+)\s+(/\s+(\S+))?\s*-\s*(.+)%;
+			# greek rating
+			my $rating_el; 
+			if(defined(${1})) {
+				$rating_el=$channel_lang eq $LANG_EN ? el2en(${1}) : ${1};
+			}
+			if(defined(${4})) {
+				if(defined($rating_el)) {
+					$rating_el.=" - ".($channel_lang eq $LANG_EN ? 
+											 el2en(${4}) : ${4});
+				} else {
+					$rating_el=$channel_lang eq $LANG_EN ? el2en(${4}) : ${4};
+				}
+			}
+			# english rating
+			my $rating_en=${3} if(defined(${3})); 
+			# rating icon
+			my $pr_rating_icon=$rating_elem[0]->attr("src");
+			$pr_rating_icon =~ s/(^\.\.\/)//;
+			$pr_rating_icon = $SITE."/".$pr_rating_icon;
+			# Set programme rating
+			if(defined($rating_el) || defined($rating_en)) {
+				$programme{"rating"} = [ () ];
+				push @{$programme{"rating"}}, [$rating_en, "MPAA"] 
+					if defined $rating_en;
+				push @{$programme{"rating"}}, [$rating_el, "GGET", 
+					[ { src=>$pr_rating_icon } ] ] 
+						if defined $rating_el;
+			}
+			#remove from parent
+			foreach(@rating_elem) {
+				$_->detach();
+			}
+		}
+		
+		# Now get the title
+		my $pr_title = get_content($title_elem);
+		next if not defined $pr_title;
+		$programme{"previously-shown"} = {} 
+			if $pr_title =~ s/\s*[(][\x{00c5}ER][)]\s*// ;
+		$pr_title =~ s/(^\s+|\s+$)//;
+		$pr_title = el2en($pr_title) if $channel_lang eq $LANG_EN;
+		$programme{"title"} = [ [$pr_title, $channel_lang] ];
+		t " title: ".el2en($pr_title);
+
+		# Get the programme url
+		my @url_elem = $title_elem->look_down("_tag" => "a", 
+														  "href"=>qr/movieid=/);
+		if(scalar(@url_elem)) {
+			my $programme_url = $BASE_URL{$channel_lang}.
+									  $url_elem[0]->attr("href");
+			#my $programme_url = $url_elem[0]->attr("href");
+			$programme{"url"} = [ $programme_url ];
+
+			if($opt_slow) {
+				# Check detail filter : channel
+				if($channels{$channel_key}{"details"}) {
+					t "added detail";
+					$programme{"detail-url"} = $programme_url;
+				}
+				
+				# Check detail filter : time
+				if(defined $programme{"detail-url"} && defined $detail_starttime
+						&& $programme{"start"} lt $detail_starttime) {
+					t "removed detail: starttime : ".
+						"$programme{'start'} < $detail_starttime";
+					delete $programme{"detail-url"};
+				}
+				if(defined $programme{"detail-url"} && defined $detail_stoptime
+						&& $programme{"start"} ge $detail_stoptime) {
+					t "removed detail: stoptime : ".
+						"$programme{'start'} >= $detail_stoptime";
+					delete $programme{"detail-url"};
+				}
+			}
+		}
+		
+		# Get the category column
+		my $category_elem = $title_elem->right();
+		if(defined $category_elem) {
+			my $item;
+			my $cat;
+			my $last_was_cat=0;
+			my @pr_cats=();
+			my %cat_ids;
+			
+			# Get category links
+			my @acategories = $category_elem->look_down("_tag" => "a", 
+																	  "href"=>qr/egenre=/);
+			foreach (@acategories) {
+				# sub category
+				if($_->attr("href")=~/egenre=(\d+).+subgenre=(\d+)/) {
+					$item=get_content($_);
+					$item = el2en($item) if $channel_lang eq $LANG_EN;
+					t " sub: $item";
+					if(defined $item && defined $cat) {
+						if($last_was_cat) {
+							#delete last category item, because it"s merged here
+							delete $pr_cats[scalar(@pr_cats)-1];
+						}
+						$last_was_cat=0;
+						push @pr_cats, [$cat.": ".$item, $channel_lang];
+					}
+					
+				# main category
+				} elsif($_->attr("href")=~/egenre=(\d+)/) {
+					$item=get_content($_);
+					$item = el2en($item) if $channel_lang eq $LANG_EN;
+					t " cat: $item";
+					if(defined $item) {
+						push @pr_cats, [$item, $channel_lang];
+						$cat=$item;
+						$last_was_cat=1;
+						$cat_ids{"${1}"}=1 if($opt_slow);
+					}
+				}
+			}
+			
+			# Set programme categories
+			if(scalar(@pr_cats)) {
+				$programme{"category"} = [ @pr_cats ];
+
+				# Check detail filter : time
+				if($opt_slow && defined $programme{"detail-url"}
+								 && keys %detail_categories) {
+					my $found=0;
+					foreach (sort keys %detail_categories) {
+						if(defined $cat_ids{$detail_categories{$_}{"id"}}) {
+							$found=1;
+							last;
+						}
+					}
+					if(not $found) {
+						t "removed detail: category";
+						delete $programme{"detail-url"};
+					}
+					#if($opt_comments) {
+					#	my $icat=0;
+					#	# Set the categories as debug info
+					#	foreach (sort keys %cat_ids) {
+					#		# Set the category as debug info
+					#		$programme{"debug_Category_".(++$icat)}=$_;
+					#	}
+					#}		
+				}
+				
+			}
+		}
+		# Update statistics
+		$num_programmes++;
+		$num_details++ if defined $programme{"detail-url"};
+
+		# Store reference
+		$previous=\%programme;
+		# Add to programmes
+		push @{$listings{$listing_day}{$channel_key}{"programmes"}}, \%programme;
+	}
+
+	# Done
+	$tree->delete();
+}
+
+# Parses programme details
+sub parse_detail( $$ ) {
+	my $channel_key=shift;
+	my $programme=shift;
+	my $channel_lang=$channels{$channel_key}{"lang"};
+	
+	# Parse data
+	my $tree = HTML::TreeBuilder->new();
+	my $data = delete $programme->{"detail-html"};
+	$tree->parse($data);
+	
+	# Get duration
+	$programme->{"length"}=(${1}*60) if $data=~m/Duration:.*?(\d+)\'/;
+	
+	# If the stop time is missing but we have the duration
+   if(!defined $programme->{"stop"} && defined $programme->{"length"}) {
+		# calculate stop time
+		# add duration plus a padding of 30 minutes, for adverts, delay, etc.
+		$programme->{"stop"}=UnixDate(DateCalc($programme->{"start"},
+			"+ ".(${1}+30)." minutes"),"%q")." ".$programme->{"timezone"};
+	}
+	
+	# Get year
+	my @elems = $tree->look_down("_tag"=>"font", "color"=>"red");
+	if(scalar @elems) {
+		my $item = get_content($elems[0]);
+		if(defined $item && $item =~ /[(](\d{4})[)]/ ) {
+			$programme->{"date"}=${1};
+		}
+	}
+
+	# Get description
+	@elems = $tree->look_down("_tag"=>"div", "style"=>qr/margin-left: 8px/);
+	if(scalar @elems) {
+		my $item = get_content($elems[0]);
+		if(defined $item) {
+			$item = el2en($item) if $channel_lang eq $LANG_EN;
+			$programme->{"desc"}=[ [ $item, $channel_lang ] ];
+		}
+	}
+
+	# Get credits
+	foreach my $credit_key (keys %{$credits_search{$channel_lang}}) {
+		my $credit_search=$credits_search{$channel_lang}{$credit_key};
+		@elems = $tree->look_down("_tag"=>"b", 
+			sub { defined $_[0]->as_text && $_[0]->as_text=~/$credit_search/ });
+		if(scalar @elems) {
+			my $parent=$elems[0]->parent;
+			$elems[0]->detach;
+			my $item = get_content($parent);
+			if(defined $item) {
+				$item = el2en($item) if $channel_lang eq $LANG_EN;
+				my @people=split(/,/, $item);
+				s/(^\s+)|(\s+$)//g foreach @people;
+				push @{$programme->{"credits"}->{ $credit_key}}, @people;
+			}
+		}
+	}
+
+	# Done
+	$tree->delete();
+}
+
+
+
+######################################################################
+# Helper subroutine definitions
+
+# Bump a YYYYMMDD date by one.
+sub nextday {
+	my $d = shift;
+	my $p = parse_date($d);
+	my $n = DateCalc($p, "+ 1 day");
+	return UnixDate($n, "%Q");
+}
+
+# Function to get a url.
+# Taken from XMLTV::Get_nice::get_nice_aux.
+# It doesn't cause script to die if the data cannot be fetched.
+# It uses the fixed delay of XMLTV::Get_nice::Delay, 
+# instead of randomized value
+# It holds statistics about fetched data
+sub get_url( $ ) {
+	my $url = shift;
+
+	if (defined $XMLTV::Get_nice::last_get_time) {
+		# A page has already been retrieved recently. See if we need
+		# to sleep for a while before getting the next page - being
+		# nice to the server.
+		my $next_get_time = $XMLTV::Get_nice::last_get_time + 
+									$XMLTV::Get_nice::Delay; #(rand $Delay);
+		my $sleep_time = $next_get_time - time();
+		sleep $sleep_time if $sleep_time > 0;
+	}
+
+	# Fetch url
+	#my $data = $XMLTV::Get_nice::get_nice_aux->($url);
+	my $data = get_nice($url);
+	
+	if(defined $data) {
+		# Update last fetch time
+		$XMLTV::Get_nice::last_get_time = time();
+
+		# Update statistics
+		$num_webgets++;
+		$size_webgets+=length $data;
+	}
+	return $data;
+}
+
+# Cleanup html
+my %warned_bad_chars;
+sub tidy( $ ) {
+	local $_ = shift;
+	t "original string" . d \$_;
+	# br to newline
+	s/<br[^>]*>/\r\n/g;
+	# remaining tags to spaces
+	s/<\/*[^>]*>/ /g;
+
+	# decode any HTML special chars (&amp; &nbsp;)
+	decode_entities($_);
+	# note &nbsp; -> \240 -> space
+
+	# get rid of known Windows encoded characters
+	# silly windows characters to simple quotes
+	tr/\221\222\223\224\226\227/\'\'\"\"\-\-/;
+	tr/\010//d;
+
+	# replace windows" "..." character
+	s/\205/.../g;
+
+	#s/([^\012\015\040-\176\240-\377]+)//g;
+
+	foreach ( m/[\200-\237]/g ) {
+		warn "stripping invalid character (".ord($_)." - $_)".
+			" from input: $_" unless $warned_bad_chars{ord($_)}++;
+	}
+	s/[\200-\237]/\?/g;
+
+	# multiple spaces to one space
+	s/[\240\s]+/ /g;
+	# trim leading and trailing spaces
+	s/^\s+//;
+	s/\s+$//;
+
+	#
+	t "cleaned string" . d \$_;
+	return $_;
+}
+
+# Extracts real data from html
+sub get_real_data( $ ) {
+	my $data=shift;
+	# Try to get the real data to speed up things and save memory
+	# Should be inside comments with text SEARCH MAIN and E N D  S E A R C H
+	my $pos=index($data, "SEARCH MAIN");
+	if($pos>0 && index($data, "E N D  S E A R C H", $pos)>0) {
+		$data=substr($data, $pos);
+		$pos=index($data, ">");
+		$data=substr($data, $pos+1);
+		$pos=index($data, "E N D  S E A R C H");
+		$data=substr($data, 0, $pos);
+		$pos=rindex($data, "<");
+		$data=substr($data, 0, $pos);
+	}
+	return $data;
+}
+
+# get element content
+sub get_content {
+	my ($elem) = @_;
+	if(ref($elem)) {
+		my $contents=tidy($elem->as_text());
+		#get_content_re($elem->content_list()));
+		return $contents if length($contents)>0;
+	}
+	return undef;
+}
+
+# get element content recursive
+sub get_content_re {
+	my (@l) = @_;
+	my $text="";
+	while (@l) {
+		my $e = shift @l;
+		if(!ref($e)) {
+			$text.= $e;
+		} else {
+			$text.=" ".get_content_re($e->content_list());
+		}
+	}
+	return $text;
+}
+
+# Greek to Latin transcoding
+sub el2en( $ ) {
+	local $_ = shift;
+	while ($_) {
+		foreach my $key (keys %EL2EN) {
+			s/($key)/$EL2EN{$key}/eg;
+		}
+		return $_;
+	}
+	return $_;
+}
+
+# Override ask_many_boolean from XMLTV::Ask
+sub _ask_many_boolean( $$@ ) {
+	my $header=shift;
+	my $default=shift;
+	my @options = @_;
+
+	if (XMLTV::GUI::get_gui_type($opt_gui) eq "tk") {
+		return XMLTV::Ask::Tk::_ask_choices($header, $default, 1, @options);
+	} else {
+		say($header);
+		return ask_many_boolean($default, @options);
+	}
+}
+
+# Formats size in b/Kb/Mb
+sub format_size($) {
+	my $sz=shift;
+	my $un="b";
+	if($sz<1024) {
+	} elsif($sz<1024*1024) {
+		$un="Kb";
+		$sz/=1024;
+	} else {
+		$un="Mb";
+		$sz/=1024*1024;
+	}
+	return sprintf("%d %s", $sz, $un);
+}
+
+# Formats time in h/m/s
+sub format_time($) {
+	my $time=shift;
+	my $secs=$time;
+	my $mins=0;
+	my $hours=0;
+	if($secs>60) {
+		$mins=$secs/60;
+		$secs%=60;
+	}
+	if($mins>60) {
+		$hours=$mins/60;
+		$mins%=60;
+	}
+	my $txt=sprintf("%d s", $secs);
+	if($mins>0 || $hours>0) {
+		$txt=sprintf("%d m %s", $mins, $txt);
+	}
+	if($hours>0) {
+		$txt=sprintf("%d h %s", $mins, $txt);
+	}
+	return $txt;
+}
+
+#sub get_size($) {
+#	return format_size(total_size(shift));
+#}
+
